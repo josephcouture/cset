@@ -47,6 +47,16 @@ namespace CSETWebCore.Business.ModuleIO
         public void ProcessStandard(ExternalStandard externalStandard)
         {
             using var transaction = _context.Database.BeginTransaction();
+
+            // A database can carry identity counters below values already in
+            // use; the v13.0.0.0 Docker backup ships NEW_REQUIREMENT at 342 and
+            // NEW_QUESTION_SETS at 648, both below rows in the tables. Inserting
+            // then collides on the primary key. RESEED with no value raises a
+            // counter to the column's maximum and leaves a correct one alone.
+            // ModuleBuilderBusiness does the same before it inserts.
+            _context.Database.ExecuteSqlRaw("DBCC CHECKIDENT('NEW_REQUIREMENT', RESEED)");
+            _context.Database.ExecuteSqlRaw("DBCC CHECKIDENT('NEW_QUESTION_SETS', RESEED)");
+
             ImportStandard(externalStandard);
             transaction.Commit();
         }
