@@ -12,6 +12,7 @@ using System.Text.RegularExpressions;
 using CSETWebCore.Model.AssessmentIO;
 using CSETWebCore.Helpers;
 using CSETWebCore.Business.GalleryParser;
+using Microsoft.EntityFrameworkCore;
 
 namespace CSETWebCore.Business.ModuleIO
 {
@@ -37,9 +38,35 @@ namespace CSETWebCore.Business.ModuleIO
 
         /// <summary>
         /// Imports a Module/Standard.
+        /// The import is all or nothing. Any failure rolls back every row
+        /// written so far, including the set and its gallery card, and
+        /// reaches the caller as an InvalidOperationException that names
+        /// the requirement and the database's own message.
         /// </summary>
         /// <param name="externalStandard"></param>
         public void ProcessStandard(ExternalStandard externalStandard)
+        {
+            using var transaction = _context.Database.BeginTransaction();
+            ImportStandard(externalStandard);
+            transaction.Commit();
+        }
+
+
+        /// <summary>
+        /// The innermost exception's message, which is where SQL Server's
+        /// own text (truncation, foreign key, primary key) ends up.
+        /// </summary>
+        private static string Innermost(Exception exc)
+        {
+            while (exc.InnerException != null)
+            {
+                exc = exc.InnerException;
+            }
+            return exc.Message;
+        }
+
+
+        private void ImportStandard(ExternalStandard externalStandard)
         {
             SETS_CATEGORY category;
             int? categoryOrder = 0;
@@ -114,14 +141,7 @@ namespace CSETWebCore.Business.ModuleIO
 
             _galleryEditor.AddGalleryItem("", "", set.Standard_ToolTip, set.Full_Name, configSetup, custom.Group_Id, colIndex);
 
-            try
-            {
-                ProcessRequirements(externalStandard, set);
-            }
-            catch (Exception exc)
-            {
-                NLog.LogManager.GetCurrentClassLogger().Error($"... {exc}");
-            }
+            ProcessRequirements(externalStandard, set);
         }
 
 
@@ -159,7 +179,16 @@ namespace CSETWebCore.Business.ModuleIO
                 if (!requirementList.Any(s => s == requirement.identifier.Trim().ToLower() + "|||" + requirement.text.Trim().ToLower()))
                 {
                     reqSequence++;
-                    var requirementResult = SaveRequirement(requirement, set.Set_Name, reqSequence   /*, new ConsoleLogger() */     );
+                    NEW_REQUIREMENT requirementResult;
+                    try
+                    {
+                        requirementResult = SaveRequirement(requirement, set.Set_Name, reqSequence   /*, new ConsoleLogger() */     );
+                    }
+                    catch (Exception exc)
+                    {
+                        NLog.LogManager.GetCurrentClassLogger().Error($"... {exc}");
+                        throw new InvalidOperationException($"Module '{set.Set_Name}' was not imported, and nothing was saved. Requirement '{requirement.identifier}' failed: {Innermost(exc)}", exc);
+                    }
 
 
                     if (requirementResult != null)
@@ -321,6 +350,10 @@ namespace CSETWebCore.Business.ModuleIO
 
 
             // SAL
+            if (externalRequirement.securityAssuranceLevels == null)
+            {
+                throw new InvalidOperationException("securityAssuranceLevels is missing. List the levels at which this requirement applies, for example [\"L\", \"M\", \"H\", \"VH\"].");
+            }
             foreach (string sal in externalRequirement.securityAssuranceLevels)
             {
                 var rl = new REQUIREMENT_LEVELS()
@@ -337,6 +370,7 @@ namespace CSETWebCore.Business.ModuleIO
 
 
             var importer = new DocumentImporter(_context);
+            int errorsBeforeReferences = result.ErrorMessages.Count();
             if (externalRequirement.references != null)
             {
                 foreach (var reference in externalRequirement.references)
@@ -352,11 +386,11 @@ namespace CSETWebCore.Business.ModuleIO
                     }
                     catch
                     {
-                        result.LogError(String.Format("Reference {0} could not be added for requirement {1} {2}.", externalRequirement.source?.FileName, externalRequirement.identifier, externalRequirement.text));
+                        result.LogError(String.Format("Reference {0} could not be added for requirement {1} {2}.", reference.FileName, externalRequirement.identifier, externalRequirement.text));
                     }
                     if (reqReference.Gen_File_Id == 0)
                     {
-                        result.LogError(String.Format("Reference {0} has not been loaded into CSET.  Please add the file and try again.", externalRequirement.source?.FileName, externalRequirement.identifier, externalRequirement.text));
+                        result.LogError(String.Format("Reference {0} has not been loaded into CSET.  Please add the file and try again.", reference.FileName, externalRequirement.identifier, externalRequirement.text));
                     }
                     else
                     {
@@ -391,15 +425,15 @@ namespace CSETWebCore.Business.ModuleIO
                 result.LogError(String.Format("Source {0} could not be added for requirement {1} {2}.", externalRequirement.source?.FileName, externalRequirement.identifier, externalRequirement.text));
             }
 
-            try
+            var referenceErrors = result.ErrorMessages.Skip(errorsBeforeReferences).ToList();
+            if (referenceErrors.Count > 0)
             {
-                _context.NEW_REQUIREMENT.Add(newRequirement);
-                _context.SaveChanges();
+                throw new InvalidOperationException(string.Join(" ", referenceErrors));
             }
-            catch (Exception exc)
-            {
-                NLog.LogManager.GetCurrentClassLogger().Error($"... {exc}");
-            }
+
+            // Not caught here: a requirement that cannot be saved stops the import.
+            _context.NEW_REQUIREMENT.Add(newRequirement);
+            _context.SaveChanges();
 
 
             // Save any Questions associated with the Requirement
@@ -490,7 +524,7 @@ namespace CSETWebCore.Business.ModuleIO
                     catch (Exception exc)
                     {
                         NLog.LogManager.GetCurrentClassLogger().Error($"... {exc}");
-                        // result.LogError(String.Format("Question {0} could not be added for requirement {1} {2}.", question, externalRequirement.Identifier, externalRequirement.Text));
+                        throw new InvalidOperationException($"Question could not be saved: {Innermost(exc)}", exc);
                     }
                 }
 
@@ -549,7 +583,7 @@ namespace CSETWebCore.Business.ModuleIO
                 catch (Exception exc)
                 {
                     NLog.LogManager.GetCurrentClassLogger().Error($"... {exc}");
-                    throw new Exception("Error saving REQUIREMENT_QUESTIONS_SETS and REQUIREMENT_QUESTIONS");
+                    throw new Exception("Error saving REQUIREMENT_QUESTIONS_SETS and REQUIREMENT_QUESTIONS", exc);
                 }
             }
         }
