@@ -55,7 +55,7 @@ namespace CSETWebCore.Helpers
 
         public void LogError(string error)
         {
-            this.logger.Log(error);
+            this.logger?.Log(error);
             errorMessages.Add(error);
         }
 
